@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package rpc;
+
+message RequestHeader {
+	fixed64 id = 1;
+	string service = 2;
+	string method = 3;
+}
+
+message ResponseHeader {
+	fixed64 id = 1;
+	string error = 2;
+	bool close = 3;
+}
