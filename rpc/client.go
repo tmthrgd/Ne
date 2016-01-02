@@ -3,12 +3,11 @@ package rpc
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"log"
+	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/golang/protobuf/proto"
 	rpcp "github.com/tmthrgd/Ne/rpc/proto"
 	"golang.org/x/net/context"
 )
@@ -22,7 +21,10 @@ type result struct {
 type Client struct {
 	conn net.Conn
 
-	id uint64
+	used map[uint64]struct{}
+
+	emu    sync.RWMutex
+	errors chan error
 
 	mu      sync.RWMutex
 	results map[uint64]chan<- result
@@ -39,22 +41,56 @@ func Dial(network, address string) (*Client, error) {
 }
 
 func NewClient(conn net.Conn) (*Client, error) {
-	var id [8]byte
-
-	if _, err := rand.Read(id[:]); err != nil {
-		return nil, err
-	}
-
 	c := &Client{
 		conn: conn,
 
-		id: binary.LittleEndian.Uint64(id[:]),
+		used: map[uint64]struct{}{0: struct{}{}},
 
 		results: make(map[uint64]chan<- result),
 	}
 
 	go c.reader()
 	return c, nil
+}
+
+func (c *Client) Errors() <-chan error {
+	c.emu.RLock()
+
+	if c.errors == nil {
+		c.emu.RUnlock()
+
+		c.emu.Lock()
+		defer c.emu.Unlock()
+
+		if c.errors == nil {
+			c.errors = make(chan error)
+		}
+
+		return c.errors
+	}
+
+	defer c.emu.RUnlock()
+	return c.errors
+}
+
+func (c *Client) error(err error) {
+	if err == nil {
+		return
+	}
+
+	c.emu.RLock()
+	defer c.emu.RUnlock()
+
+	select {
+	case c.errors <- err:
+	default:
+		go func() {
+			c.emu.RLock()
+			defer c.emu.RUnlock()
+
+			c.errors <- err
+		}()
+	}
 }
 
 func (c *Client) reader() {
@@ -68,7 +104,13 @@ func (c *Client) reader() {
 		if err != nil {
 			protoBufferPool.Put(buf)
 
-			log.Println(err)
+			if op, ok := err.(*net.OpError); ok {
+				if op.Err.Error() == "use of closed network connection" {
+					return
+				}
+			}
+
+			c.error(err)
 			continue
 		}
 
@@ -76,7 +118,7 @@ func (c *Client) reader() {
 		if err = buf.DecodeMessage(&res); err != nil {
 			protoBufferPool.Put(buf)
 
-			log.Println(err)
+			c.error(err)
 			continue
 		}
 
@@ -88,7 +130,7 @@ func (c *Client) reader() {
 
 			protoBufferPool.Put(buf)
 
-			log.Println("invalid id")
+			c.error(errors.New("invalid id"))
 			continue
 		}
 
@@ -106,13 +148,27 @@ func (c *Client) sendRequest(service, method string, in interface{}) (uint64, ch
 	defer protoBufferPool.Put(wbuf)
 	wbuf.Reset()
 
-	id := atomic.AddUint64(&c.id, 1)
-
-	if err := wbuf.EncodeMessage(&rpcp.RequestHeader{
-		Id:      id,
+	req := &rpcp.RequestHeader{
 		Service: service,
 		Method:  method,
-	}); err != nil {
+	}
+
+	var id [8]byte
+
+	for {
+		if _, err := rand.Read(id[:]); err != nil {
+			return 0, nil, err
+		}
+
+		req.Id = binary.LittleEndian.Uint64(id[:])
+
+		if _, used := c.used[req.Id]; !used {
+			c.used[req.Id] = struct{}{}
+			break
+		}
+	}
+
+	if err := wbuf.EncodeMessage(req); err != nil {
 		return 0, nil, err
 	}
 
@@ -123,11 +179,11 @@ func (c *Client) sendRequest(service, method string, in interface{}) (uint64, ch
 	waiter := make(chan result, 1)
 
 	c.mu.Lock()
-	c.results[id] = waiter
+	c.results[req.Id] = waiter
 	c.mu.Unlock()
 
 	_, err := c.conn.Write(wbuf.Bytes())
-	return id, waiter, err
+	return req.Id, waiter, err
 }
 
 func (c *Client) Invoke(ctx context.Context, service, method string, in, out interface{}) error {
@@ -164,20 +220,26 @@ func (c *Client) Invoke(ctx context.Context, service, method string, in, out int
 func (c *Client) InvokeStream(ctx context.Context, service, method string, in interface{}, newOut func() interface{}, recvdOut func(interface{}), closed func()) error {
 	id, waiter, err := c.sendRequest(service, method, in)
 
+	cleanup := func() {
+		c.mu.Lock()
+		delete(c.results, id)
+		c.mu.Unlock()
+
+		close(waiter)
+
+		closed()
+	}
+
 	if err != nil {
+		if waiter != nil {
+			cleanup()
+		}
+
 		return err
 	}
 
 	go func() {
-		defer func() {
-			c.mu.Lock()
-			delete(c.results, id)
-			c.mu.Unlock()
-
-			close(waiter)
-
-			closed()
-		}()
+		defer cleanup()
 
 		for {
 			select {
@@ -185,7 +247,7 @@ func (c *Client) InvokeStream(ctx context.Context, service, method string, in in
 				defer protoBufferPool.Put(r.buf)
 
 				if len(r.res.Error) != 0 {
-					log.Println(r.res.Error)
+					c.error(RemoteError(r.res.Error))
 					continue
 				}
 
@@ -196,16 +258,13 @@ func (c *Client) InvokeStream(ctx context.Context, service, method string, in in
 				out := newOut()
 
 				if err := r.buf.Unmarshal(out.(proto.Message)); err != nil {
-					log.Println(err)
+					c.error(err)
 					continue
 				}
 
 				recvdOut(out)
 			case <-ctx.Done():
-				if err := ctx.Err(); err != nil {
-					log.Println(err)
-				}
-
+				c.error(ctx.Err())
 				return
 			}
 		}

@@ -1,3 +1,3 @@
 package rpc
 
-//go:generate protoc --gogofast_out=. rpc.proto
+//go:generate protoc --gofast_out=. rpc.proto

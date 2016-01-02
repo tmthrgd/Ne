@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/golang/protobuf/proto"
 	rpcp "github.com/tmthrgd/Ne/rpc/proto"
 )
 
@@ -46,6 +46,9 @@ type service struct {
 type Server struct {
 	ln   net.Listener
 	conn net.PacketConn
+
+	emu    sync.RWMutex
+	errors chan error
 
 	mu sync.RWMutex
 	m  map[string]*service
@@ -95,6 +98,46 @@ func (s *Server) register(sd *ServiceDesc, ss interface{}) {
 	s.m[sd.ServiceName] = srv
 }
 
+func (s *Server) Errors() <-chan error {
+	s.emu.RLock()
+
+	if s.errors == nil {
+		s.emu.RUnlock()
+
+		s.emu.Lock()
+		defer s.emu.Unlock()
+
+		if s.errors == nil {
+			s.errors = make(chan error)
+		}
+
+		return s.errors
+	}
+
+	defer s.emu.RUnlock()
+	return s.errors
+}
+
+func (s *Server) error(err error) {
+	if err == nil {
+		return
+	}
+
+	s.emu.RLock()
+	defer s.emu.RUnlock()
+
+	select {
+	case s.errors <- err:
+	default:
+		go func() {
+			c.emu.RLock()
+			defer c.emu.RUnlock()
+
+			s.errors <- err
+		}()
+	}
+}
+
 func (s *Server) ListenAndServe(network, address string) error {
 	switch network {
 	case "udp", "udp4", "udp6", "ip", "ip4", "ip6", "unixgram":
@@ -138,48 +181,32 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 
 		go func(conn net.Conn) {
-			if err := s.serveReadWriter(conn); err != nil {
-				log.Println(err)
+			defer conn.Close()
+
+			for {
+				rbuf := protoBufferPool.Get().(*proto.Buffer)
+
+				rb := rbuf.Bytes()
+				n, err := conn.Read(rb[:cap(rb)])
+				rbuf.SetBuf(rb[:n])
+
+				if err != nil {
+					protoBufferPool.Put(rbuf)
+
+					if err != io.EOF {
+						s.error(err)
+					}
+
+					return
+				}
+
+				go func(rbuf *proto.Buffer) {
+					defer protoBufferPool.Put(rbuf)
+
+					s.error(s.execute(rbuf, conn.Write))
+				}(rbuf)
 			}
 		}(conn)
-	}
-}
-
-func (s *Server) ServeConn(conn net.Conn) error {
-	if s.ln != nil || s.conn != nil {
-		return errors.New("Serve or ServePacket already called")
-	}
-
-	return s.serveReadWriter(conn)
-}
-
-func (s *Server) serveReadWriter(conn net.Conn) error {
-	defer conn.Close()
-
-	for {
-		rbuf := protoBufferPool.Get().(*proto.Buffer)
-
-		rb := rbuf.Bytes()
-		n, err := conn.Read(rb[:cap(rb)])
-		rbuf.SetBuf(rb[:n])
-
-		if err != nil {
-			protoBufferPool.Put(rbuf)
-
-			if err == io.EOF {
-				return nil
-			}
-
-			return err
-		}
-
-		go func(rbuf *proto.Buffer) {
-			defer protoBufferPool.Put(rbuf)
-
-			if err := s.execute(rbuf, conn.Write); err != nil {
-				log.Println(err)
-			}
-		}(rbuf)
 	}
 }
 
@@ -213,11 +240,9 @@ func (s *Server) ServePacket(conn net.PacketConn) error {
 		go func(rbuf *proto.Buffer, addr net.Addr) {
 			defer protoBufferPool.Put(rbuf)
 
-			if err := s.execute(rbuf, func(p []byte) (int, error) {
+			s.error(s.execute(rbuf, func(p []byte) (int, error) {
 				return conn.WriteTo(p, addr)
-			}); err != nil {
-				log.Println(err)
-			}
+			}))
 		}(rbuf, addr)
 	}
 }
@@ -278,16 +303,12 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 
 			res.Error = err.Error()
 
-			if err = s.sendResposne(res, nil, write); err != nil {
-				log.Println(err)
-			}
+			s.error(s.sendResposne(res, nil, write))
 		}, func() {
-			if err := s.sendResposne(&rpcp.ResponseHeader{
+			s.error(s.sendResposne(&rpcp.ResponseHeader{
 				Id:    req.Id,
 				Close: true,
-			}, nil, write); err != nil {
-				log.Println(err)
-			}
+			}, nil, write))
 		})
 
 		if err != nil {

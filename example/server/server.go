@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -48,7 +49,7 @@ func (notification) Subscribe(in *pb.Channel) (<-chan *pb.Notification, error) {
 }
 
 func main() {
-	ip, err := Ne.IP("fda2:ea02:479f::/48", 0x9d26f5d4df2cbbb4)
+	ip, err := Ne.IP("fda2:ea02:479f::/48", pb.Id)
 
 	if err != nil {
 		panic(err)
@@ -59,18 +60,30 @@ func main() {
 		pb.RegisterGreeterServer(s, server{})
 		pb.RegisterNotificationsServer(s, notification{})
 
+		go func(s *rpc.Server) {
+			for err := range s.Errors() {
+				log.Println(err)
+			}
+		}(s)
+
 		if err := s.ListenAndServe("udp6", net.JoinHostPort(ip.String(), "http")); err != nil {
 			panic(err)
 		}
 	}()
 
-	path := Ne.Path("/var", 0x9d26f5d4df2cbbb4)
+	path := Ne.Path("/var", pb.Id)
 	os.Remove(path)
 	defer os.Remove(path)
 
 	s := rpc.NewServer()
 	pb.RegisterGreeterServer(s, server{})
 	pb.RegisterNotificationsServer(s, notification{})
+
+	go func(s *rpc.Server) {
+		for err := range s.Errors() {
+			log.Println(err)
+		}
+	}(s)
 
 	if err := s.ListenAndServe("unix", path); err != nil {
 		panic(err)

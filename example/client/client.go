@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 
 	"github.com/tmthrgd/Ne"
@@ -11,7 +12,7 @@ import (
 )
 
 func main() {
-	ip, err := Ne.IP("fda2:ea02:479f::/48", 0x9d26f5d4df2cbbb4)
+	ip, err := Ne.IP("fda2:ea02:479f::/48", pb.Id)
 
 	if err != nil {
 		panic(err)
@@ -24,6 +25,12 @@ func main() {
 	}
 
 	defer conn.Close()
+
+	go func(conn *rpc.Client) {
+		for err := range conn.Errors() {
+			log.Println(err)
+		}
+	}(conn)
 
 	res, err := pb.NewGreeterClient(conn).SayHello(context.Background(), &pb.HelloRequest{Name: "Bob"})
 
@@ -39,13 +46,19 @@ func main() {
 		panic(err)
 	}
 
-	conn, err = rpc.Dial("unix", Ne.Path("/var", 0x9d26f5d4df2cbbb4))
+	conn, err = rpc.Dial("unix", Ne.Path("/var", pb.Id))
 
 	if err != nil {
 		panic(err)
 	}
 
 	defer conn.Close()
+
+	go func(conn *rpc.Client) {
+		for err := range conn.Errors() {
+			log.Println(err)
+		}
+	}(conn)
 
 	res, err = pb.NewGreeterClient(conn).SayHello(context.Background(), &pb.HelloRequest{Name: "Ted"})
 
