@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -60,11 +62,37 @@ func main() {
 		pb.RegisterGreeterServer(s, server{})
 		pb.RegisterNotificationsServer(s, notification{})
 
+		var nonce [12]byte
+
+		if _, err := rand.Read(nonce[:]); err != nil {
+			panic(err)
+		}
+
+		s.GetSecretKey = func(_ net.Addr, in bool) ([]byte, []byte) {
+			var key [16]byte
+
+			if in {
+				return key[:], nil
+			}
+
+			for i := len(nonce) - 1; i >= 0; i-- {
+				nonce[i]++
+
+				if nonce[i] != 0 {
+					break
+				}
+			}
+
+			return key[:], nonce[:]
+		}
+
 		go func(s *rpc.Server) {
 			for err := range s.Errors() {
 				log.Println(err)
 			}
 		}(s)
+
+		fmt.Printf("listening on %s\n", net.JoinHostPort(ip.String(), "http"))
 
 		if err := s.ListenAndServe("udp6", net.JoinHostPort(ip.String(), "http")); err != nil {
 			panic(err)
@@ -84,6 +112,8 @@ func main() {
 			log.Println(err)
 		}
 	}(s)
+
+	fmt.Printf("listening on %v\n", path)
 
 	if err := s.ListenAndServe("unix", path); err != nil {
 		panic(err)

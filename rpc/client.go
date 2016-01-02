@@ -1,9 +1,12 @@
 package rpc
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"sync"
 
@@ -13,7 +16,8 @@ import (
 )
 
 type result struct {
-	buf *proto.Buffer
+	back *proto.Buffer
+	buf  *proto.Buffer
 
 	res *rpcp.ResponseHeader
 }
@@ -28,6 +32,8 @@ type Client struct {
 
 	mu      sync.RWMutex
 	results map[uint64]chan<- result
+
+	GetSecretKey func(addr net.Addr, in bool) ([]byte, []byte)
 }
 
 func Dial(network, address string) (*Client, error) {
@@ -114,6 +120,58 @@ func (c *Client) reader() {
 			continue
 		}
 
+		var back *proto.Buffer
+
+		if c.GetSecretKey != nil {
+			if key, _ := c.GetSecretKey(c.conn.RemoteAddr(), true); key != nil {
+				block, err := aes.NewCipher(key)
+
+				if err != nil {
+					c.error(err)
+					continue
+				}
+
+				aead, err := cipher.NewGCM(block)
+
+				if err != nil {
+					c.error(err)
+					continue
+				}
+
+				rb := buf.Bytes()
+
+				if len(rb) <= aead.NonceSize() {
+					c.error(io.ErrUnexpectedEOF)
+					continue
+				}
+
+				var aad []byte
+
+				switch addr := c.conn.LocalAddr().(type) {
+				case *net.UDPAddr:
+					aad = append([]byte(nil), []byte(addr.IP)...)
+					aad = append(aad, make([]byte, 2)...)
+					binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+				case *net.TCPAddr:
+					aad = append([]byte(nil), []byte(addr.IP)...)
+					aad = append(aad, make([]byte, 2)...)
+					binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+				case *net.IPAddr:
+					aad = []byte(addr.IP)
+				}
+
+				ct := rb[aead.NonceSize():]
+
+				if ct, err = aead.Open(ct[:0], rb[:aead.NonceSize()], ct, aad); err != nil {
+					c.error(err)
+					continue
+				}
+
+				back = buf
+				buf = proto.NewBuffer(ct)
+			}
+		}
+
 		var res rpcp.ResponseHeader
 		if err = buf.DecodeMessage(&res); err != nil {
 			protoBufferPool.Put(buf)
@@ -135,6 +193,7 @@ func (c *Client) reader() {
 		}
 
 		waiter <- result{
+			back,
 			buf,
 			&res,
 		}
@@ -182,6 +241,59 @@ func (c *Client) sendRequest(service, method string, in interface{}) (uint64, ch
 	c.results[req.Id] = waiter
 	c.mu.Unlock()
 
+	if c.GetSecretKey != nil {
+		if key, nonce := c.GetSecretKey(c.conn.RemoteAddr(), false); key != nil {
+			block, err := aes.NewCipher(key)
+
+			if err != nil {
+				return req.Id, waiter, err
+			}
+
+			aead, err := cipher.NewGCM(block)
+
+			if err != nil {
+				return req.Id, waiter, err
+			}
+
+			ebuf := protoBufferPool.Get().(*proto.Buffer)
+			defer func() {
+				if cap(ebuf.Bytes()) == protoBufferCapacity {
+					protoBufferPool.Put(ebuf)
+				}
+			}()
+			ebuf.Reset()
+
+			eb := ebuf.Bytes()
+			eb = eb[:cap(eb)]
+
+			copy(eb, nonce)
+
+			var aad []byte
+
+			switch addr := c.conn.LocalAddr().(type) {
+			case *net.UDPAddr:
+				aad = append([]byte(nil), []byte(addr.IP)...)
+				aad = append(aad, make([]byte, 2)...)
+				binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+			case *net.TCPAddr:
+				aad = append([]byte(nil), []byte(addr.IP)...)
+				aad = append(aad, make([]byte, 2)...)
+				binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+			case *net.IPAddr:
+				aad = []byte(addr.IP)
+			}
+
+			wb := wbuf.Bytes()
+
+			ct := eb[len(nonce):len(nonce)]
+			ct = aead.Seal(ct, nonce, wb, aad)
+
+			//_, err = c.conn.Write(append(nonce, ct...))
+			_, err = c.conn.Write(eb[:len(nonce)+len(ct)])
+			return req.Id, waiter, err
+		}
+	}
+
 	_, err := c.conn.Write(wbuf.Bytes())
 	return req.Id, waiter, err
 }
@@ -205,7 +317,11 @@ func (c *Client) Invoke(ctx context.Context, service, method string, in, out int
 
 	select {
 	case r := <-waiter:
-		defer protoBufferPool.Put(r.buf)
+		if r.back != nil {
+			defer protoBufferPool.Put(r.back)
+		} else {
+			defer protoBufferPool.Put(r.buf)
+		}
 
 		if len(r.res.Error) != 0 {
 			return RemoteError(r.res.Error)
@@ -244,7 +360,11 @@ func (c *Client) InvokeStream(ctx context.Context, service, method string, in in
 		for {
 			select {
 			case r := <-waiter:
-				defer protoBufferPool.Put(r.buf)
+				if r.back != nil {
+					defer protoBufferPool.Put(r.back)
+				} else {
+					defer protoBufferPool.Put(r.buf)
+				}
 
 				if len(r.res.Error) != 0 {
 					c.error(RemoteError(r.res.Error))

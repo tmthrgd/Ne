@@ -1,6 +1,9 @@
 package rpc
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -52,6 +55,8 @@ type Server struct {
 
 	mu sync.RWMutex
 	m  map[string]*service
+
+	GetSecretKey func(addr net.Addr, in bool) ([]byte, []byte)
 }
 
 func NewServer() *Server {
@@ -130,8 +135,8 @@ func (s *Server) error(err error) {
 	case s.errors <- err:
 	default:
 		go func() {
-			c.emu.RLock()
-			defer c.emu.RUnlock()
+			s.emu.RLock()
+			defer s.emu.RUnlock()
 
 			s.errors <- err
 		}()
@@ -203,7 +208,7 @@ func (s *Server) Serve(ln net.Listener) error {
 				go func(rbuf *proto.Buffer) {
 					defer protoBufferPool.Put(rbuf)
 
-					s.error(s.execute(rbuf, conn.Write))
+					s.error(s.execute(rbuf, conn.Write, conn.RemoteAddr()))
 				}(rbuf)
 			}
 		}(conn)
@@ -242,12 +247,58 @@ func (s *Server) ServePacket(conn net.PacketConn) error {
 
 			s.error(s.execute(rbuf, func(p []byte) (int, error) {
 				return conn.WriteTo(p, addr)
-			}))
+			}, addr))
 		}(rbuf, addr)
 	}
 }
 
-func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) error {
+func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error), addr net.Addr) error {
+	if s.GetSecretKey != nil {
+		if key, _ := s.GetSecretKey(addr, true); key != nil {
+			block, err := aes.NewCipher(key)
+
+			if err != nil {
+				return err
+			}
+
+			aead, err := cipher.NewGCM(block)
+
+			if err != nil {
+				return err
+			}
+
+			rb := rbuf.Bytes()
+
+			if len(rb) <= aead.NonceSize() {
+				return io.ErrUnexpectedEOF
+			}
+
+			nonce := rb[:aead.NonceSize()]
+			pt := rb[len(nonce):]
+
+			var aad []byte
+
+			switch addr := addr.(type) {
+			case *net.UDPAddr:
+				aad = append([]byte(nil), []byte(addr.IP)...)
+				aad = append(aad, make([]byte, 2)...)
+				binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+			case *net.TCPAddr:
+				aad = append([]byte(nil), []byte(addr.IP)...)
+				aad = append(aad, make([]byte, 2)...)
+				binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+			case *net.IPAddr:
+				aad = []byte(addr.IP)
+			}
+
+			if pt, err = aead.Open(pt[:0], nonce, pt, aad); err != nil {
+				return err
+			}
+
+			rbuf = proto.NewBuffer(pt)
+		}
+	}
+
 	var req rpcp.RequestHeader
 	if err := rbuf.DecodeMessage(&req); err != nil {
 		return err
@@ -261,7 +312,7 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 		return s.sendResposne(&rpcp.ResponseHeader{
 			Id:    req.Id,
 			Error: "service not implemented",
-		}, nil, write)
+		}, nil, write, addr)
 	}
 
 	dec := func(in interface{}) error {
@@ -279,7 +330,7 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 			res.Error = err.Error()
 		}
 
-		return s.sendResposne(res, out, write)
+		return s.sendResposne(res, out, write, addr)
 	} else {
 		stream, ok := srv.sd[req.Method]
 
@@ -287,7 +338,7 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 			return s.sendResposne(&rpcp.ResponseHeader{
 				Id:    req.Id,
 				Error: "method not implemented",
-			}, nil, write)
+			}, nil, write, addr)
 		}
 
 		err := stream.Handler(srv.server, dec, func(out interface{}) {
@@ -295,7 +346,7 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 				Id: req.Id,
 			}
 
-			err := s.sendResposne(res, out, write)
+			err := s.sendResposne(res, out, write, addr)
 
 			if err == nil {
 				return
@@ -303,26 +354,26 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 
 			res.Error = err.Error()
 
-			s.error(s.sendResposne(res, nil, write))
+			s.error(s.sendResposne(res, nil, write, addr))
 		}, func() {
 			s.error(s.sendResposne(&rpcp.ResponseHeader{
 				Id:    req.Id,
 				Close: true,
-			}, nil, write))
+			}, nil, write, addr))
 		})
 
 		if err != nil {
 			return s.sendResposne(&rpcp.ResponseHeader{
 				Id:    req.Id,
 				Error: err.Error(),
-			}, nil, write)
+			}, nil, write, addr)
 		}
 
 		return nil
 	}
 }
 
-func (s *Server) sendResposne(res *rpcp.ResponseHeader, out interface{}, write func(p []byte) (int, error)) error {
+func (s *Server) sendResposne(res *rpcp.ResponseHeader, out interface{}, write func(p []byte) (int, error), addr net.Addr) error {
 	wbuf := protoBufferPool.Get().(*proto.Buffer)
 	defer func() {
 		if cap(wbuf.Bytes()) == protoBufferCapacity {
@@ -337,6 +388,59 @@ func (s *Server) sendResposne(res *rpcp.ResponseHeader, out interface{}, write f
 
 	if out != nil {
 		if err := wbuf.Marshal(out.(proto.Message)); err != nil {
+			return err
+		}
+	}
+
+	if s.GetSecretKey != nil {
+		if key, nonce := s.GetSecretKey(addr, false); key != nil {
+			block, err := aes.NewCipher(key)
+
+			if err != nil {
+				return err
+			}
+
+			aead, err := cipher.NewGCM(block)
+
+			if err != nil {
+				return err
+			}
+
+			ebuf := protoBufferPool.Get().(*proto.Buffer)
+			defer func() {
+				if cap(ebuf.Bytes()) == protoBufferCapacity {
+					protoBufferPool.Put(ebuf)
+				}
+			}()
+			ebuf.Reset()
+
+			eb := ebuf.Bytes()
+			eb = eb[:cap(eb)]
+
+			copy(eb, nonce)
+
+			var aad []byte
+
+			switch addr := addr.(type) {
+			case *net.UDPAddr:
+				aad = append([]byte(nil), []byte(addr.IP)...)
+				aad = append(aad, make([]byte, 2)...)
+				binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+			case *net.TCPAddr:
+				aad = append([]byte(nil), []byte(addr.IP)...)
+				aad = append(aad, make([]byte, 2)...)
+				binary.LittleEndian.PutUint16(aad[len(addr.IP):], uint16(addr.Port))
+			case *net.IPAddr:
+				aad = []byte(addr.IP)
+			}
+
+			wb := wbuf.Bytes()
+
+			ct := eb[len(nonce):len(nonce)]
+			ct = aead.Seal(ct, nonce, wb, aad)
+
+			//_, err = write(append(nonce, ct...))
+			_, err = write(eb[:len(nonce)+len(ct)])
 			return err
 		}
 	}

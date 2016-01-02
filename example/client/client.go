@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
 	"net"
@@ -31,6 +32,30 @@ func main() {
 			log.Println(err)
 		}
 	}(conn)
+
+	var nonce [12]byte
+
+	if _, err := rand.Read(nonce[:]); err != nil {
+		panic(err)
+	}
+
+	conn.GetSecretKey = func(_ net.Addr, in bool) ([]byte, []byte) {
+		var key [16]byte
+
+		if in {
+			return key[:], nil
+		}
+
+		for i := len(nonce) - 1; i >= 0; i-- {
+			nonce[i]++
+
+			if nonce[i] != 0 {
+				break
+			}
+		}
+
+		return key[:], nonce[:]
+	}
 
 	res, err := pb.NewGreeterClient(conn).SayHello(context.Background(), &pb.HelloRequest{Name: "Bob"})
 
