@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -66,6 +67,8 @@ func main() {
 			}
 		}(s)
 
+		fmt.Printf("listening on %s\n", net.JoinHostPort(ip.String(), "http"))
+
 		if err := s.ListenAndServe("udp6", net.JoinHostPort(ip.String(), "http")); err != nil {
 			panic(err)
 		}
@@ -84,6 +87,8 @@ func main() {
 			log.Println(err)
 		}
 	}(s)
+
+	fmt.Printf("listening on %v\n", path)
 
 	if err := s.ListenAndServe("unix", path); err != nil {
 		panic(err)

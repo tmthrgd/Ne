@@ -130,8 +130,8 @@ func (s *Server) error(err error) {
 	case s.errors <- err:
 	default:
 		go func() {
-			c.emu.RLock()
-			defer c.emu.RUnlock()
+			s.emu.RLock()
+			defer s.emu.RUnlock()
 
 			s.errors <- err
 		}()
