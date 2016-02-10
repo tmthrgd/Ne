@@ -7,6 +7,7 @@ import (
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/golang/protobuf/proto"
 	rpcp "github.com/tmthrgd/Ne/rpc/proto"
@@ -50,6 +51,8 @@ type Server struct {
 	emu    sync.RWMutex
 	errors chan error
 
+	serving int32
+
 	mu sync.RWMutex
 	m  map[string]*service
 }
@@ -65,7 +68,7 @@ func (s *Server) RegisterService(sd *ServiceDesc, ss interface{}) {
 	st := reflect.TypeOf(ss)
 
 	if !st.Implements(ht) {
-		log.Fatalf("grpc: Server.RegisterService found the handler of type %v that does not satisfy %v", st, ht)
+		log.Fatalf("nerpc: Server.RegisterService found the handler of type %v that does not satisfy %v", st, ht)
 	}
 
 	s.register(sd, ss)
@@ -76,13 +79,13 @@ func (s *Server) register(sd *ServiceDesc, ss interface{}) {
 	defer s.mu.Unlock()
 
 	if _, ok := s.m[sd.ServiceName]; ok {
-		log.Fatalf("grpc: Server.RegisterService found duplicate service registration for %q", sd.ServiceName)
+		log.Fatalf("nerpc: Server.RegisterService found duplicate service registration for %q", sd.ServiceName)
 	}
 
 	srv := &service{
 		server: ss,
-		md:     make(map[string]*MethodDesc),
-		sd:     make(map[string]*StreamDesc),
+		md:     make(map[string]*MethodDesc, len(sd.Methods)),
+		sd:     make(map[string]*StreamDesc, len(sd.Streams)),
 	}
 
 	for i := range sd.Methods {
@@ -129,6 +132,11 @@ func (s *Server) error(err error) {
 	select {
 	case s.errors <- err:
 	default:
+		if s.errors == nil {
+			log.Println(err)
+			return
+		}
+
 		go func() {
 			s.emu.RLock()
 			defer s.emu.RUnlock()
@@ -160,7 +168,7 @@ func (s *Server) ListenAndServe(network, address string) error {
 }
 
 func (s *Server) Serve(ln net.Listener) error {
-	if s.ln != nil || s.conn != nil {
+	if !atomic.CompareAndSwapInt32(&s.serving, 0, 1) {
 		return errors.New("Serve or ServePacket already called")
 	}
 
@@ -211,7 +219,7 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) ServePacket(conn net.PacketConn) error {
-	if s.ln != nil || s.conn != nil {
+	if !atomic.CompareAndSwapInt32(&s.serving, 0, 1) {
 		return errors.New("Serve or ServePacket already called")
 	}
 
@@ -258,7 +266,7 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 	s.mu.RUnlock()
 
 	if !ok {
-		return s.sendResposne(&rpcp.ResponseHeader{
+		return s.sendResponse(&rpcp.ResponseHeader{
 			Id:    req.Id,
 			Error: "service not implemented",
 		}, nil, write)
@@ -279,50 +287,47 @@ func (s *Server) execute(rbuf *proto.Buffer, write func(p []byte) (int, error)) 
 			res.Error = err.Error()
 		}
 
-		return s.sendResposne(res, out, write)
-	} else {
-		stream, ok := srv.sd[req.Method]
-
-		if !ok {
-			return s.sendResposne(&rpcp.ResponseHeader{
-				Id:    req.Id,
-				Error: "method not implemented",
-			}, nil, write)
-		}
-
+		return s.sendResponse(res, out, write)
+	} else if stream, ok := srv.sd[req.Method]; ok {
 		err := stream.Handler(srv.server, dec, func(out interface{}) {
 			res := &rpcp.ResponseHeader{
 				Id: req.Id,
 			}
 
-			err := s.sendResposne(res, out, write)
+			if err := s.sendResponse(res, out, write); err != nil {
+				res.Error = err.Error()
 
-			if err == nil {
-				return
+				s.error(err)
+				s.error(s.sendResponse(res, nil, write))
 			}
-
-			res.Error = err.Error()
-
-			s.error(s.sendResposne(res, nil, write))
 		}, func() {
-			s.error(s.sendResposne(&rpcp.ResponseHeader{
+			s.error(s.sendResponse(&rpcp.ResponseHeader{
 				Id:    req.Id,
 				Close: true,
 			}, nil, write))
 		})
 
-		if err != nil {
-			return s.sendResposne(&rpcp.ResponseHeader{
-				Id:    req.Id,
-				Error: err.Error(),
-			}, nil, write)
+		if err == nil {
+			return nil
 		}
 
-		return nil
+		if e := s.sendResponse(&rpcp.ResponseHeader{
+			Id:    req.Id,
+			Error: err.Error(),
+		}, nil, write); e != nil {
+			return e
+		}
+
+		return err
 	}
+
+	return s.sendResponse(&rpcp.ResponseHeader{
+		Id:    req.Id,
+		Error: "method not implemented",
+	}, nil, write)
 }
 
-func (s *Server) sendResposne(res *rpcp.ResponseHeader, out interface{}, write func(p []byte) (int, error)) error {
+func (s *Server) sendResponse(res *rpcp.ResponseHeader, out interface{}, write func(p []byte) (int, error)) error {
 	wbuf := protoBufferPool.Get().(*proto.Buffer)
 	defer func() {
 		if cap(wbuf.Bytes()) == protoBufferCapacity {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"log"
 	"net"
 	"sync"
 
@@ -84,6 +85,11 @@ func (c *Client) error(err error) {
 	select {
 	case c.errors <- err:
 	default:
+		if c.errors == nil {
+			log.Println(err)
+			return
+		}
+
 		go func() {
 			c.emu.RLock()
 			defer c.emu.RUnlock()
@@ -145,7 +151,11 @@ func (c *Client) reader() {
 
 func (c *Client) sendRequest(service, method string, in interface{}) (uint64, chan result, error) {
 	wbuf := protoBufferPool.Get().(*proto.Buffer)
-	defer protoBufferPool.Put(wbuf)
+	defer func() {
+		if cap(wbuf.Bytes()) == protoBufferCapacity {
+			protoBufferPool.Put(wbuf)
+		}
+	}()
 	wbuf.Reset()
 
 	req := &rpcp.RequestHeader{
@@ -233,6 +243,8 @@ func (c *Client) InvokeStream(ctx context.Context, service, method string, in in
 	if err != nil {
 		if waiter != nil {
 			cleanup()
+		} else {
+			closed()
 		}
 
 		return err
